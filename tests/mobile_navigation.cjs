@@ -1,0 +1,18 @@
+const fs=require('fs'),vm=require('vm'),assert=require('node:assert/strict'),path=require('path');
+const python=fs.readFileSync(path.join(__dirname,'../scripts/mobile_navigation.py'),'utf8');
+const script=python.match(/SCRIPT\s*=\s*'''([\s\S]*?)'''/)[1];
+const handlers={};const controls={hidden:true};const top={events:{},addEventListener(k,f){this.events[k]=f;}};const section={events:{},addEventListener(k,f){this.events[k]=f;}};
+const ids=new Map([['mobile-return',controls],['return-top',top],['return-section',section]]);const groups=new Map();let selected=null;let reduced=false;const scrolls=[];
+const node=(name,start,end,visible=true,hidden=false)=>({name,closest:()=>hidden?{}:null,getClientRects:()=>visible?[{}]:[],getBoundingClientRect:()=>({top:start,bottom:end}),scrollIntoView(options){selected={name,options};}});
+const header=node('header',-2000,-100);ids.set('analysis-top',header);
+const document={getElementById:id=>ids.get(id),querySelector:()=>({getBoundingClientRect:()=>({top:0,bottom:55})}),querySelectorAll:selector=>groups.get(selector)||[]};
+const window={scrollY:0,location:{hash:'#chat-record-fictional'},matchMedia:()=>({matches:reduced}),addEventListener(k,f){handlers[k]=f;},scrollTo(options){scrolls.push(options);}};
+const context={document,window,requestAnimationFrame:f=>f()};vm.createContext(context);vm.runInContext(script,context);
+assert.equal(controls.hidden,true);window.scrollY=2000;handlers.scroll();assert.equal(controls.hidden,false);
+groups.set('.conversation-review .segment',[node('closed',-400,400,false),node('active-chat',-2000,600)]);groups.set('#conversation-review',[node('chat-root',-10000,2000)]);section.events.click();assert.equal(selected.name,'active-chat');assert.equal(selected.options.behavior,'smooth');assert.equal(window.location.hash,'#chat-record-fictional');
+groups.clear();groups.set('.stage-detail',[node('current-stage',-500,800)]);groups.set('#relationship-changes',[node('stages-root',-2000,5000)]);section.events.click();assert.equal(selected.name,'current-stage');
+groups.clear();groups.set('#event-review details[id]',[node('hidden-proof',-500,800,true,true),node('open-proof',-600,700)]);groups.set('article[id]',[node('event',-1000,2000)]);section.events.click();assert.equal(selected.name,'open-proof');
+groups.set('#event-review details[id]',[]);section.events.click();assert.equal(selected.name,'event');
+groups.clear();section.events.click();assert.equal(selected.name,'header');reduced=true;top.events.click();assert.equal(scrolls.at(-1).top,0);assert.equal(scrolls.at(-1).behavior,'auto');
+window.scrollY=0;handlers.scroll();assert.equal(controls.hidden,true);
+console.log('PASS: mobile controls select current chat/stage/proof/event, skip closed or filtered content, preserve the reading hash, honor reduced motion, and hide near the top. Not a visual browser test.');

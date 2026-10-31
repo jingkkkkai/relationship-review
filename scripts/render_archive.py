@@ -51,8 +51,16 @@ def valid_id(value):
     return isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_-]+', value)
 
 
+DEFAULT_NAMES = {'self': '你', 'other': '他'}
+
+
+def pronoun_note(names):
+    """Top-of-report legend; chat originals keep their own 我／你."""
+    return f'稱呼說明：這份報告裡的「{names["self"]}」是匯出這份對話、閱讀報告的人，「{names["other"]}」是對話裡的另一個人。聊天原文照原樣呈現，裡面的「我」「你」不改。'
+
+
 def display_names(data):
-    names = {'self': '我', 'other': '對方'}
+    names = dict(DEFAULT_NAMES)
     config = data.get('display_names')
     if config is None:
         return names
@@ -64,11 +72,38 @@ def display_names(data):
             if not isinstance(label, str) or not label.strip() or len(label) > 40 or any(ord(c) < 32 for c in label):
                 raise ValueError('角色名稱須為簡短且非空白的文字')
             names[role] = label.strip()
-    if names != {'self': '我', 'other': '對方'} and config.get('explicitly_requested') is not True:
-        raise ValueError('只有使用者明確指定時才可替換我／對方，不自動使用匯出名稱')
+    if names != DEFAULT_NAMES and config.get('explicitly_requested') is not True:
+        raise ValueError('只有使用者明確指定時才可替換你／他，不自動使用匯出名稱')
     if names['self'] == names['other']:
         raise ValueError('雙方角色名稱不可相同')
     return names
+
+
+def edit_groups(data):
+    """Only group source-verified versions; retain every raw record and anchor."""
+    records = data['records']
+    by_id = {record['id']: record for record in records}
+    order = {record['id']: index for index, record in enumerate(records)}
+    groups = data.get('edit_groups', [])
+    if not isinstance(groups, list):
+        raise ValueError('edit_groups 須為已核對來源的編輯群組清單')
+    originals, membership = {}, {}
+    for group in groups:
+        if not isinstance(group, dict) or group.get('source_verified') is not True or not isinstance(group.get('source'), str) or not group['source'].strip():
+            raise ValueError('編輯合併需明確的版本來源與 source_verified: true，不從相似文字猜測')
+        original, versions = group.get('original_record_id'), group.get('version_record_ids')
+        if not isinstance(original, str) or not isinstance(versions, list) or len(versions) < 2 or versions[0] != original:
+            raise ValueError('編輯群組須由原始訊息開始，並依順序包含至少兩個版本')
+        if any(not isinstance(identity, str) or identity not in by_id or identity in membership for identity in versions) or len(versions) != len(set(versions)):
+            raise ValueError('編輯版本 ID 不存在、重複或已歸屬其他群組')
+        if [order[identity] for identity in versions] != sorted(order[identity] for identity in versions):
+            raise ValueError('編輯版本順序須與來源核對後的紀錄順序一致，不能倒置時間線')
+        role = by_id[original]['speaker_role']
+        if role == 'system' or any(by_id[identity]['speaker_role'] != role for identity in versions):
+            raise ValueError('只能合併已確認屬於同一發言者的訊息編輯版本')
+        originals[original] = versions
+        membership.update((identity, original) for identity in versions)
+    return originals, membership
 
 
 def validate_archive(data):
@@ -144,6 +179,7 @@ def validate_archive(data):
         flattened.extend(members)
     if flattened != ids:
         raise ValueError('片段須按原始排列連續完整涵蓋訊息，不得漏筆、重複或任意重排')
+    edit_groups(data)
     return set(segment_ids)
 
 
@@ -157,14 +193,60 @@ def render(data, materials_root=None):
     validate_archive(data)
     names = display_names(data)
     by_id = {r['id']: r for r in data['records']}
+    groups, membership = edit_groups(data)
     materials = Materials(materials_root)
+    original_segments = {identity: segment['id'] for segment in data['segments'] for identity in segment['record_ids'] if identity in groups}
+
+    def content(r):
+        """Render a single snapshot, including media and exact-version replies."""
+        kind = display_type(r)
+        material_items = r.get('media', [])
+        represented = {m.get('type') for m in material_items if isinstance(m, dict)}
+        media_types = r.get('media_types', [])
+        if not media_types and r.get('attachments') and kind == 'text' and not material_items:
+            media_types = ['file']
+        media_text = ''.join(MARKERS[m] for m in media_types if m != kind and m not in represented)
+        attachment_html = ''.join(materials.render(item) for item in material_items)
+        if kind in ('reel', 'threads_post'):
+            body_html = link(r.get('share_url'), MARKERS[kind], platform=kind, attachment=True)
+            if r.get('share_url') and body_html == esc(MARKERS[kind]):
+                body_html += '（這個連結無法安全顯示）'
+            elif not r.get('share_url'):
+                body_html += '（匯出檔沒有附連結）'
+            if r.get('comment'):
+                body_html += '\n' + linked_text(r['comment'])
+        else:
+            body_html = linked_text(visible_body(r))
+        quote = ''
+        reply = r.get('reply')
+        if reply:
+            if reply.get('record_id'):
+                original = by_id[reply['record_id']]
+                who = '系統通知' if original['speaker_role'] == 'system' else names[original['speaker_role']]
+                preview = visible_body(original)
+                if len(preview) > 240:
+                    preview = preview[:240] + '…（點開看原訊息）'
+                quote = f'<blockquote class="reply"><a href="#chat-record-{attr(original["id"])}">回覆 {esc(who)} · {esc(original["timestamp"])}</a><p>{esc(preview)}</p></blockquote>'
+            else:
+                quote = '<blockquote class="reply"><span>引用的訊息（找不到原訊息）</span><p>' + esc(reply.get('text') or '匯出檔沒有附上引用內容') + '</p></blockquote>'
+        reactions = [] if kind == 'reaction' else list(dict.fromkeys(reaction['emoji'] for reaction in r.get('reactions', [])))
+        chips = ''.join(f'<span class="reaction">({esc(value)})</span>' for value in reactions)
+        return quote + f'<p class="text">{body_html}</p>' + attachment_html + (f'<p class="media">{esc(media_text)}</p>' if media_text else '') + chips
+
     buttons = '<button type="button" data-filter="">全部</button>' + ''.join(f'<button type="button" data-filter="{esc(c)}">{esc(c)}</button>' for c in CATEGORIES)
     panels = []
     for index, segment in enumerate(data['segments']):
         messages = []
         previous_day = None
+        relocated = set()
         for identity in segment['record_ids']:
             r = by_id[identity]
+            original_id = membership.get(identity)
+            if original_id is not None and identity != original_id:
+                if original_segments[original_id] != segment['id'] and original_id not in relocated:
+                    messages.append(f'<p class="edit-location"><a href="#chat-edits-{attr(original_id)}">這則修改已經併進原訊息的編輯紀錄，點這裡看</a></p>')
+                    relocated.add(original_id)
+                continue
             date = re.match(r'^(\d{4}[/-]\d{1,2}[/-]\d{1,2})', r['timestamp'])
             day = date.group(1) if date else segment['date']
             if day != previous_day:
@@ -175,40 +257,19 @@ def render(data, materials_root=None):
             kind = display_type(r)
             role = r['speaker_role']
             meta = time_label if role == 'system' else names[role] + ' · ' + time_label
-            material_items = r.get('media', [])
-            represented = {m.get('type') for m in material_items if isinstance(m, dict)}
-            media_types = r.get('media_types', [])
-            if not media_types and r.get('attachments') and kind == 'text' and not material_items:
-                media_types = ['file']
-            media_text = ''.join(MARKERS[m] for m in media_types if m != kind and m not in represented)
-            attachment_html = ''.join(materials.render(item) for item in material_items)
-            body = visible_body(r)
-            if kind in ('reel', 'threads_post'):
-                body_html = link(r.get('share_url'), MARKERS[kind], platform=kind)
-                if r.get('share_url') and body_html == esc(MARKERS[kind]):
-                    body_html += '（連結無法安全呈現）'
-                elif not r.get('share_url'):
-                    body_html += '（匯出資料未附連結）'
-                if r.get('comment'):
-                    body_html += '\n' + linked_text(r['comment'])
+            if identity in groups:
+                versions = groups[identity]
+                latest = by_id[versions[-1]]
+                old = []
+                for number, version_id in enumerate(versions[:-1]):
+                    version = by_id[version_id]
+                    label = '原始版本' if number == 0 else f'較早版本 {number + 1}'
+                    old.append(f'<div class="edit-version" id="chat-record-{attr(version_id)}"><p class="meta">{esc(label)} · 來源時間 {esc(version["timestamp"])}</p>{content(version)}</div>')
+                history = f'<details class="edit-history" id="chat-edits-{attr(identity)}"><summary>編輯紀錄（{len(old)} 個舊版本）</summary><p class="source">時間和位置以第一次傳送為準；上面是最新內容，下面依序是改之前的版本。</p>{"".join(old)}</details>'
+                messages.append(f'<div class="message speaker-{role}" id="chat-message-{attr(identity)}"><div class="bubble"><p class="meta">{esc(meta)}</p><div class="latest-version" id="chat-record-{attr(latest["id"])}">{content(latest)}</div><span class="edited">(已編輯)</span>{history}</div></div>')
             else:
-                body_html = linked_text(body)
-            quote = ''
-            reply = r.get('reply')
-            if reply:
-                if reply.get('record_id'):
-                    original = by_id[reply['record_id']]
-                    who = '系統通知' if original['speaker_role'] == 'system' else names[original['speaker_role']]
-                    preview = visible_body(original)
-                    if len(preview) > 240:
-                        preview = preview[:240] + '…（點開看原訊息）'
-                    quote = f'<blockquote class="reply"><a href="#chat-record-{attr(original["id"])}">回覆 {esc(who)} · {esc(original["timestamp"])}</a><p>{esc(preview)}</p></blockquote>'
-                else:
-                    quote = '<blockquote class="reply"><span>引用訊息（原訊息無法定位）</span><p>' + esc(reply.get('text') or '匯出資料未附引用內容') + '</p></blockquote>'
-            reactions = [] if kind == 'reaction' else list(dict.fromkeys(reaction['emoji'] for reaction in r.get('reactions', [])))
-            chips = ''.join(f'<span class="reaction">({esc(value)})</span>' for value in reactions)
-            edited = '<span class="edited">(已編輯)</span>' if r.get('version_status') == 'edited' else ''
-            messages.append(f'<div class="message speaker-{role}" id="chat-record-{attr(identity)}"><div class="bubble"><p class="meta">{esc(meta)}</p>{quote}<p class="text">{body_html}</p>{attachment_html}{("<p class=media>" + esc(media_text) + "</p>") if media_text else ""}{edited}{chips}</div></div>')
+                edited = '<span class="edited">(已編輯；匯出檔沒有舊版本)</span>' if r.get('version_status') == 'edited' else ''
+                messages.append(f'<div class="message speaker-{role}" id="chat-record-{attr(identity)}"><div class="bubble"><p class="meta">{esc(meta)}</p>{content(r)}{edited}</div></div>')
         navigation = []
         if index:
             navigation.append(f'<a href="#{esc(context_anchor(data["segments"][index-1]["id"]))}">← 上一段</a>')
@@ -217,7 +278,7 @@ def render(data, materials_root=None):
         cats = ' · '.join(segment['categories'])
         panels.append(f'<details class="segment" id="{esc(context_anchor(segment["id"]))}" data-categories="{esc(json.dumps(segment["categories"],ensure_ascii=False))}"><summary>{esc(segment["date"])}｜{esc(segment["title"])}<small>{esc(cats)}</small></summary><p>{esc(segment.get("note", ""))}</p>{"".join(messages)}<nav>{"　".join(navigation)}</nav></details>')
     return f'''<details class="panel conversation-review" id="conversation-review"><summary>完整對話：依氣氛分類</summary>
-<a href="#analysis-top">回到關係分析</a><p>這裡保留所選對話的全部匯出紀錄；郵件與手機部分遮蔽，附件依隱私檢查結果呈現，仍含私密內容。氣氛是方便回顧的整理方式，不是對雙方感受的判決。</p><p>共 {len(data['records'])} 筆匯出紀錄，整理成 {len(data['segments'])} 段；不等於人類發言數。</p><div aria-label="氣氛篩選">{buttons}</div><label>搜尋片段：<input id="chat-search" type="search" placeholder="輸入想找的文字"></label><p id="chat-count" aria-live="polite"></p><noscript>目前無法使用篩選，仍可按日期展開全部片段。</noscript>{''.join(panels)}</details>'''
+<a href="#analysis-top">回到關係分析</a><p>這裡收錄你選的這段對話的所有紀錄。文字裡的 email 和手機號碼已經部分遮住，圖片、語音等附件和分享連結保持原樣，所以還是有私密內容。依氣氛分類只是方便你回顧，不代表你們當時的感受一定是這樣。</p><p>共 {len(data['records'])} 筆紀錄，分成 {len(data['segments'])} 段。紀錄數包含貼圖、系統通知等，不等於兩個人說了幾句話。{' 已確認的編輯版本合併顯示，原始紀錄未刪減。' if groups else ''}</p><div aria-label="氣氛篩選">{buttons}</div><label>搜尋片段：<input id="chat-search" type="search" placeholder="輸入想找的文字"></label><p id="chat-count" aria-live="polite"></p><noscript>現在沒辦法篩選，但還是可以照日期點開每一段。</noscript>{''.join(panels)}</details>'''
 
 
 ARCHIVE_STYLE = '''
@@ -236,6 +297,10 @@ ARCHIVE_STYLE = '''
 .conversation-review .chat-day{text-align:center;font-size:14px;color:#526962;margin:20px 0 10px}
 .conversation-review .reaction{display:inline-block;font-size:16px;margin:4px 6px 0 0}
 .conversation-review .edited{display:block;font-size:12px;color:#526962}
+.conversation-review .edit-history{margin-top:8px;padding:8px 0 0;border-top:1px solid #b8cec3}
+.conversation-review .edit-history>summary{font-size:14px;color:#526962;font-weight:500}
+.conversation-review .edit-version{background:#ffffff99;border-left:3px solid #aac5b8;margin-top:10px;padding:8px 12px;border-radius:6px}
+.conversation-review .edit-location{font-size:14px;color:#526962;margin:10px 0}
 .conversation-review .meta,.conversation-review small{display:block;color:#526962;font-size:14px}
 .conversation-review button,.conversation-review input{font:inherit;max-width:100%;padding:10px;border:1px solid #a6bfb4;border-radius:8px;margin:5px}
 .conversation-review button{cursor:pointer;background:white}

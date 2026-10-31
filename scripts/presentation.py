@@ -33,7 +33,16 @@ def attr(value):
     return html.escape(str(value), quote=True)
 
 
+SOCIAL_DOMAINS = ('instagram.com', 'threads.net', 'threads.com')
+PRIVATE_QUERY_KEYS = {'access_token', 'token', 'auth', 'authorization', 'password', 'secret', 'signature', 'credential', 'x-amz-signature', 'x-amz-credential'}
+
+
+def social_host(host):
+    return bool(host) and any(host == domain or host.endswith('.' + domain) for domain in SOCIAL_DOMAINS)
+
+
 def safe_url(value, platform=None):
+    """Validate URL structure, never redact identifiers or rewrite the target."""
     if not isinstance(value, str) or not value or any(ord(c) <= 32 or ord(c) == 127 for c in value):
         return None
     try:
@@ -42,10 +51,7 @@ def safe_url(value, platform=None):
         if url.scheme not in ('http', 'https') or not host or url.username or url.password:
             return None
         _ = url.port
-        decoded = unquote(unquote(value))
-        if mask(decoded) != decoded or '\\' in value:
-            return None
-        if any(key.lower() in {'access_token', 'token', 'auth', 'authorization', 'password', 'secret', 'signature', 'credential', 'x-amz-signature', 'x-amz-credential'} for key, _ in parse_qsl(url.query)):
+        if '\\' in value:
             return None
         allowed = {'reel': ('instagram.com',), 'threads_post': ('threads.net', 'threads.com')}
         if platform in allowed and not any(host == d or host.endswith('.' + d) for d in allowed[platform]):
@@ -55,11 +61,23 @@ def safe_url(value, platform=None):
     return value
 
 
-def link(url, label, platform=None):
+def private_text_url(value):
+    """Check prose links separately; social profile paths are identifiers, not contacts."""
+    parsed = urlsplit(value)
+    path = '' if social_host(parsed.hostname) else parsed.path
+    probe = unquote(unquote(path + '?' + parsed.query + '#' + parsed.fragment))
+    return mask(probe) != probe or any(key.lower() in PRIVATE_QUERY_KEYS for key, _ in parse_qsl(parsed.query))
+
+
+def link(url, label, platform=None, *, attachment=False):
     target = safe_url(url, platform)
+    if target and not attachment and private_text_url(target):
+        target = None
     if not target:
-        return '（連結含個資或無法安全呈現，未提供）' if str(label).startswith(('http://', 'https://')) else esc(label)
-    return f'<a href="{attr(target)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">{esc(label)}</a>'
+        return '（連結含個資或無法安全顯示，先不提供）' if str(label).startswith(('http://', 'https://')) else esc(label)
+    # A validated URL label must not go through the contact regex a second time.
+    caption = attr(label) if str(label) == target else esc(label)
+    return f'<a href="{attr(target)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">{caption}</a>'
 
 
 def linked_text(value):
@@ -97,13 +115,11 @@ class Materials:
         kind = item['type']
         label = LABELS[kind]
         if not item.get('path') and not item.get('url'):
-            return '<p class="media">' + esc(label + ' ' + item.get('reason', '匯出資料未附原檔')) + '</p>'
-        if item.get('privacy_reviewed') is not True:
-            return '<p class="media">' + esc(label + ' 含個資或尚未完成隱私檢查，未嵌入') + '</p>'
+            return '<p class="media">' + esc(label + ' ' + item.get('reason', '匯出檔沒有附原檔')) + '</p>'
         if not item.get('path'):
             if item.get('url') and safe_url(item['url']):
-                return '<p class="media">' + link(item['url'], label + ' 開啟原始連結') + '（僅有外部連結，未自動載入）</p>'
-            return '<p class="media">' + esc(label + ' ' + item.get('reason', '匯出資料未附原檔')) + '</p>'
+                return '<p class="media">' + link(item['url'], label + ' 開啟原始連結', attachment=True) + '（只有外部連結，不會自動開啟）</p>'
+            return '<p class="media">' + esc(label + ' ' + item.get('reason', '匯出檔沒有附原檔')) + '</p>'
         if self.root is None:
             raise ValueError('嵌入本機附件時須指定 --materials-root，不可默默只留標記')
         raw = item['path']
@@ -132,9 +148,6 @@ class Materials:
             }
             if mime in signatures and not signatures[mime]:
                 raise ValueError('附件內容與 MIME 不符，請核對原檔')
-            if mime == 'text/plain':
-                # Text attachments are also subject to contact masking, never embed raw text.
-                payload = mask(payload.decode('utf-8')).encode('utf-8')
             self.total += size
             self.cache[key] = 'data:' + mime + ';base64,' + base64.b64encode(payload).decode('ascii')
         uri = self.cache[key]

@@ -1,0 +1,8 @@
+# 真實對話匯出與分析結果，切勿提交
+data/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
