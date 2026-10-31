@@ -1,0 +1,92 @@
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'"><title>IG 本機對話篩選</title><style>body{font:18px/1.7 system-ui,'PingFang TC','Microsoft JhengHei',sans-serif;background:#f5f6ef;color:#203a36;margin:0}main{max-width:900px;padding:28px;margin:auto}section{background:white;border:1px solid #d5dfd9;border-radius:16px;padding:22px;margin:20px 0}h1{line-height:1.3}button,input,select{font:inherit;max-width:100%}button{background:#236b5d;color:white;padding:10px 20px;border:0;border-radius:10px;cursor:pointer}button:disabled{opacity:.5}label{display:block;margin:12px 0}li{margin:8px 0}a{color:#236b5d;overflow-wrap:anywhere}#status{white-space:pre-wrap;overflow-wrap:anywhere}small{display:block;color:#526961}.choice{padding:10px;border-bottom:1px solid #dae3df}.choice input{margin-right:12px}#result a{display:block;padding:8px}progress{width:100%}</style></head><body><main><h1>只保留想回顧的 IG 對話</h1><p>不需要 Python。這個頁面不連網；選取的檔案在瀏覽器內整理，原檔不會改動。完成後由你決定是否把新資料包上傳給 ChatGPT。</p><section><h2>1．選取匯出資料</h2><label>方式 A：選取 IG ZIP<input id="zip" type="file" accept=".zip"></label><p>若 ZIP 格式不支援，請先用電腦內建功能解壓，再選整個解壓資料夾。</p><label>方式 B：選取解壓資料夾<input id="folder" type="file" webkitdirectory multiple></label><small>資料夾模式會保留相對路徑。請選匯出根資料夾，讓位於其他資料夾的附件也能找到。</small><button id="scan">列出對話名稱</button></section><section><h2>2．選一個私人聊天室</h2><div id="threads">尚未讀取檔案。</div><label>每個資料包大小：<select id="size"><option value="200">約 200 MiB</option><option value="100">約 100 MiB</option><option value="50">約 50 MiB</option></select></label><small>這是此工具的打包大小，不是平台保證的上傳限制。資料包可能有多個，每包可獨立解壓。群組不適用此初版。</small><button id="pack" disabled>產生選定對話資料包</button></section><section aria-live="polite"><h2>處理狀態</h2><progress id="progress" value="0" max="1"></progress><p id="status">準備好了。</p><div id="result"></div></section><p>下載所有資料包和清單，交給分析 skill。這裡只做檔案整理，不代表訊息或附件已被分析。若顯示缺檔，請把清單一起提供。</p></main><script>
+'use strict';
+const enc=new TextEncoder(), dec=new TextDecoder('utf-8',{fatal:true}), MAX_JSON=64*1024*1024, MAX_SCAN=256*1024*1024;
+function fail(s){throw new Error(s)}
+function pathSafe(n){if(!n||n.startsWith('/')||n.includes('\\')||n.split('/').some(p=>p==='..'||p==='.')||n.split('/')[0].includes(':')||/[\x00-\x1f]/.test(n))fail('檔案含不安全路徑，已停止。');return n}
+const dv=b=>new DataView(b.buffer,b.byteOffset,b.byteLength);
+async function bytes(blob,a=0,b=blob.size){return new Uint8Array(await blob.slice(a,b).arrayBuffer())}
+function crc32(b){let c=0xffffffff;for(const v of b){c^=v;for(let i=0;i<8;i++)c=(c>>>1)^((c&1)?0xedb88320:0)}return (c^0xffffffff)>>>0}
+async function zipEntries(file){
+ const tail=await bytes(file,Math.max(0,file.size-65557));let end=-1;
+ for(let i=tail.length-22;i>=0;i--)if(dv(tail).getUint32(i,true)===0x06054b50&&i+22+dv(tail).getUint16(i+20,true)===tail.length){end=i;break}
+ if(end<0)fail('無法辨認 ZIP。請用電腦內建功能解壓後，改選資料夾。');
+ const t=dv(tail),count=t.getUint16(end+10,true),size=t.getUint32(end+12,true),offset=t.getUint32(end+16,true);
+ if(t.getUint16(end+4,true)||t.getUint16(end+6,true)||t.getUint16(end+8,true)!==count)fail('不支援多卷 ZIP；請先解壓後選資料夾。');
+ if(count===65535||size===0xffffffff||offset===0xffffffff)fail('此 ZIP 使用 ZIP64。請先解壓，再選資料夾；不需要安裝 Python。');
+ if(size>64*1024*1024||offset+size>file.size-tail.length+end)fail('ZIP 索引異常或過大。請先解壓後選資料夾。');
+ const c=await bytes(file,offset,offset+size),v=dv(c),entries=new Map();let p=0;
+ for(let i=0;i<count;i++){
+  if(p+46>c.length||v.getUint32(p,true)!==0x02014b50)fail('ZIP 索引不完整。');
+  let flags=v.getUint16(p+8,true),method=v.getUint16(p+10,true),crc=v.getUint32(p+16,true),compressed=v.getUint32(p+20,true),raw=v.getUint32(p+24,true),nl=v.getUint16(p+28,true),el=v.getUint16(p+30,true),cl=v.getUint16(p+32,true),at=v.getUint32(p+42,true);
+  if(p+46+nl+el+cl>c.length)fail('ZIP 索引長度異常。');
+  const name=pathSafe(dec.decode(c.subarray(p+46,p+46+nl)));
+  if(entries.has(name))fail('ZIP 含重複路徑，無法安全選取。');
+  if(((v.getUint32(p+38,true)>>>16)&0xf000)===0xa000)fail('ZIP 含符號連結，已停止。');
+  if(flags&1)fail('不支援加密 ZIP，請先解壓後選資料夾。');
+  if(raw===0xffffffff||compressed===0xffffffff||at===0xffffffff)fail('附件使用 ZIP64，請先解壓後選資料夾。');
+  const entry={name,method,crc,compressed,raw};
+  entry.payload=async()=>{const h=await bytes(file,at,at+30);if(h.length!==30||dv(h).getUint32(0,true)!==0x04034b50)fail('ZIP 檔案標頭損壞。');const hv=dv(h),start=at+30+hv.getUint16(26,true)+hv.getUint16(28,true);if(start+compressed>offset)fail('ZIP 附件範圍異常。');return file.slice(start,start+compressed)};
+  entries.set(name,entry);p+=46+nl+el+cl;
+ }
+ return entries;
+}
+function folderEntries(files){const map=new Map();for(const f of files){let n=f.webkitRelativePath||f.name;const cut=n.indexOf('/');if(cut>=0)n=n.slice(cut+1);pathSafe(n);if(map.has(n))fail('資料夾含重複路徑。');map.set(n,{name:n,method:0,raw:f.size,compressed:f.size,crc:null,payload:async()=>f})}return map}
+async function readJSON(e){
+ if(e.raw>MAX_JSON||e.compressed>MAX_JSON)fail('單個訊息 JSON 超過 64 MiB。請縮小匯出日期範圍或改用可處理本機檔案的環境。');
+ const blob=await e.payload();let b;
+ if(e.method===0)b=await bytes(blob);
+ else if(e.method===8){
+  let ds;try{ds=new DecompressionStream('deflate-raw')}catch{fail('瀏覽器不支援此 ZIP 的解壓。請更新瀏覽器，或先解壓後選資料夾。')}
+  const r=blob.stream().pipeThrough(ds).getReader(),chunks=[];let n=0;
+  try{while(true){const part=await r.read();if(part.done)break;n+=part.value.length;if(n>MAX_JSON||n>e.raw){await r.cancel();fail('JSON 解壓大小異常，已停止。')}chunks.push(part.value)}}finally{r.releaseLock()}
+  b=new Uint8Array(n);let pos=0;for(const c of chunks){b.set(c,pos);pos+=c.length}
+ }else fail('不支援此 ZIP 壓縮方式，請先解壓後選資料夾。');
+ if(b.length!==e.raw||e.crc!==null&&crc32(b)!==e.crc)fail('JSON 檔案大小或校驗不符，已停止。');
+ return JSON.parse(dec.decode(b).replace(/^\uFEFF/,''));
+}
+function repair(s){if(typeof s!=='string'||![...s].every(c=>c.codePointAt(0)<=255))return s;try{return dec.decode(Uint8Array.from([...s],c=>c.charCodeAt(0)))}catch{return s}}
+async function scan(entries,onProgress=()=>{}){
+ const threads=new Map(),skipped=[];let total=0,done=0;const candidates=[...entries.values()].filter(e=>/(^|\/)message[^/]*\.json$/i.test(e.name));
+ for(const e of candidates){total+=e.raw;if(total>MAX_SCAN)fail('候選訊息 JSON 合計超過 256 MiB。請縮小日期範圍，或使用可讀取本機檔案的環境。');const d=await readJSON(e);done++;onProgress(done,candidates.length);
+  if(!d||!Array.isArray(d.messages)){skipped.push(e.name);continue}
+  const folder=e.name.slice(0,e.name.lastIndexOf('/'));let th=threads.get(folder);
+  if(!th){th={id:'T'+String(threads.size+1).padStart(3,'0'),folder,title:'',participants:[],files:[],count:0,min:null,max:null};threads.set(folder,th)}
+  th.title=repair(d.title||th.title)||'未命名對話';th.files.push(e.name);th.count+=d.messages.length;
+  for(const person of d.participants||[]){if(person&&typeof person.name==='string'){const name=repair(person.name);if(!th.participants.includes(name))th.participants.push(name)}}
+  for(const msg of d.messages){const t=msg&&msg.timestamp_ms;if(typeof t==='number'&&Number.isFinite(t)){th.min=th.min===null?t:Math.min(th.min,t);th.max=th.max===null?t:Math.max(th.max,t)}}
+ }
+ return {threads:[...threads.values()],skipped};
+}
+function* uris(v){if(Array.isArray(v)){for(const x of v)yield* uris(x)}else if(v&&typeof v==='object'){for(const [k,x] of Object.entries(v)){if(k==='uri'&&typeof x==='string')yield x;else yield* uris(x)}}}
+async function selection(entries,thread){const names=new Set(thread.files),missing=new Set(),ambiguous=new Set(),external=new Set();
+ for(const n of thread.files){for(const u of uris(await readJSON(entries.get(n)))){if(/^https?:\/\//i.test(u)){external.add(u);continue}pathSafe(u);const exact=entries.get(u);const options=exact?[exact.name]:[...entries.keys()].filter(n=>n.endsWith('/'+u));if(options.length===1)names.add(options[0]);else if(!options.length)missing.add(u);else ambiguous.add(u)}}
+ return {names:[...names].sort(),missing:[...missing],ambiguous:[...ambiguous],external:[...external]};
+}
+async function storedEntry(name,blob){const data=await bytes(blob);return {name,method:0,crc:crc32(data),raw:data.length,compressed:data.length,payload:async()=>blob}}
+function header(n){return new Uint8Array(n)}
+async function makeZip(entries){
+ const chunks=[],central=[];let offset=0;
+ if(entries.length>=65535)fail('單包檔案太多，需分包。');
+ for(const e of entries){if(![0,8].includes(e.method))fail('附件壓縮格式不支援，請先解壓後選資料夾。');const name=enc.encode(pathSafe(e.name));if(name.length>65535)fail('檔案名稱太長。');let blob=await e.payload(),crc=e.crc;
+  if(crc===null){if(blob.size>256*1024*1024)fail('單一附件過大，請分開提供附件；此工具沒有刪除原檔。');crc=crc32(await bytes(blob))}
+  const h=header(30),v=dv(h);v.setUint32(0,0x04034b50,true);v.setUint16(4,20,true);v.setUint16(6,0x800,true);v.setUint16(8,e.method,true);v.setUint16(12,33,true);v.setUint32(14,crc,true);v.setUint32(18,e.compressed,true);v.setUint32(22,e.raw,true);v.setUint16(26,name.length,true);
+  const c=header(46),cv=dv(c);cv.setUint32(0,0x02014b50,true);cv.setUint16(4,20,true);cv.setUint16(6,20,true);cv.setUint16(8,0x800,true);cv.setUint16(10,e.method,true);cv.setUint16(14,33,true);cv.setUint32(16,crc,true);cv.setUint32(20,e.compressed,true);cv.setUint32(24,e.raw,true);cv.setUint16(28,name.length,true);cv.setUint32(42,offset,true);
+  chunks.push(h,name,blob);central.push(c,name);offset+=h.length+name.length+blob.size;if(offset>=0xffffffff)fail('單包超出 ZIP32 範圍。');
+ }
+ const centralSize=central.reduce((n,c)=>n+c.length,0),end=header(22),ev=dv(end);ev.setUint32(0,0x06054b50,true);ev.setUint16(8,entries.length,true);ev.setUint16(10,entries.length,true);ev.setUint32(12,centralSize,true);ev.setUint32(16,offset,true);return new Blob([...chunks,...central,end],{type:'application/zip'});
+}
+function partitions(entries,limit){const parts=[];let part=[],size=0;for(const e of entries){const cost=e.compressed+76+2*enc.encode(e.name).length;if(cost>limit)fail('有單一檔案大於資料包大小。請選較大分包大小或分開提供該附件。');if(part.length&&(size+cost>limit||part.length>=60000)){parts.push(part);part=[];size=0}part.push(e);size+=cost}if(part.length)parts.push(part);return parts}
+const $=id=>document.getElementById(id);let current=null,groups=[],urls=[];
+function clearResults(){for(const u of urls)URL.revokeObjectURL(u);urls=[];$('result').replaceChildren()}
+function status(text){$('status').textContent=text}
+function download(blob,name){const a=document.createElement('a'),u=URL.createObjectURL(blob);urls.push(u);a.href=u;a.download=name;a.textContent='下載 '+name+'（'+(blob.size/1024/1024).toFixed(1)+' MiB）';$('result').append(a)}
+function busy(b){$('scan').disabled=b;$('pack').disabled=b||!current;$('zip').disabled=b;$('folder').disabled=b}
+$('zip').addEventListener('change',()=>{$('folder').value='';current=null;groups=[];clearResults();$('threads').textContent='請重新列出對話名稱。';$('pack').disabled=true});
+$('folder').addEventListener('change',()=>{$('zip').value='';current=null;groups=[];clearResults();$('threads').textContent='請重新列出對話名稱。';$('pack').disabled=true});
+$('scan').addEventListener('click',async()=>{busy(true);current=null;clearResults();$('threads').replaceChildren();try{status('正在讀取對話名稱，尚未分析訊息。');const entries=$('zip').files[0]?await zipEntries($('zip').files[0]):folderEntries([...$('folder').files]);if(!entries.size)fail('請先選 ZIP 或資料夾。');const result=await scan(entries,(n,total)=>{$('progress').value=n/Math.max(total,1)});groups=result.threads;if(!groups.length)fail('沒有找到支援的 IG 訊息 JSON。請確認匯出格式是 JSON、所選範圍含訊息。');current=entries;
+ for(const t of groups){const label=document.createElement('label');label.className='choice';const radio=document.createElement('input');radio.type='radio';radio.name='thread';radio.value=t.id;radio.disabled=t.participants.length!==2;label.append(radio,document.createTextNode(t.title+' · '+t.participants.join('／')+' · '+t.count+' 筆匯出紀錄'+(radio.disabled?'（需要兩人私人聊天室）':'')));const detail=document.createElement('small');const date=x=>x===null?'不明':new Date(x).toLocaleDateString('zh-TW',{timeZone:'Asia/Taipei'});detail.textContent=date(t.min)+'–'+date(t.max)+'；來源：'+t.folder;label.append(detail);$('threads').append(label)}status('名稱清單已準備好。'+(result.skipped.length?'有 '+result.skipped.length+' 個 message JSON 結構不支援；清單可能不完整。':''));
+ }catch(e){status('停止：'+e.message+'\n原檔沒有改動。')}finally{busy(false)}});
+$('pack').addEventListener('click',async()=>{busy(true);clearResults();try{const checked=document.querySelector('input[name=thread]:checked');if(!checked)fail('請先選一個私人聊天室。');const thread=groups.find(t=>t.id===checked.value);status('正在整理選定對話與可找到的附件。');const selected=await selection(current,thread),entries=selected.names.map(n=>current.get(n));const limit=Number($('size').value)*1024*1024-1024*1024,parts=partitions(entries,limit);const manifest={tool:'IG 本機篩選',thread,selected_files:selected.names,missing_attachments:selected.missing,ambiguous_attachments:selected.ambiguous,external_uris_not_fetched:selected.external,parts:parts.map((p,i)=>({name:'IG_選定對話_'+(i+1)+'.zip',files:p.map(e=>e.name)})),note:'所有資料包共同組成選定資料。未分析訊息、未讀附件內容；不支援的檔案不等於不存在。'};
+ for(let i=0;i<parts.length;i++){const blob=await makeZip(parts[i]);download(blob,'IG_選定對話_'+(i+1)+'.zip');$('progress').value=(i+1)/parts.length}download(new Blob([JSON.stringify(manifest,null,2)],{type:'application/json'}),'IG_資料清單.json');status('完成。請下載全部 '+parts.length+' 包和資料清單。\n缺附件：'+selected.missing.length+'；路徑不明確：'+selected.ambiguous.length+'。\n工具不會自行打開外部連結，也沒有分析對話。');
+ }catch(e){clearResults();status('停止：'+e.message+'\n原檔沒有改動。')}finally{busy(false)}});
+</script></body></html>

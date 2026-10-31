@@ -1,0 +1,4 @@
+interface:
+  display_name: "關係回顧"
+  short_description: "整理 IG 或 LINE 對話與補充事件，產出可回查依據的繁體中文關係圖解"
+  default_prompt: "請使用 $relationship-review 分析我提供的 IG 或 LINE 對話，依流程確認對象、收集補充事件，產出 ELI5 HTML。"
